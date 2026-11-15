@@ -7,14 +7,13 @@
 // (correct decision still scores +12-2=+10). Proof generation (snarkjs +
 // Kurier, wait-for-Finalized) is the v2 upgrade; see README.md.
 //
-// v1.5 (2026-11-15) — EKSPERIMEN: response signing pakai kunci hex-decoded.
-// Secret sudah di-rotate + sinkron tapi preflight tetap gagal, jadi yang
-// tersisa: platform mungkin memverifikasi signature jawaban dengan kunci
-// hasil decode hex (32 byte), bukan string secret-nya. v1.5 menandatangani
-// SEMUA response (handshake + decision) dengan kunci hex-decoded; kalau
-// preflight lolos, konvensi ini yang benar. Kalau tetap gagal, konvensi
-// string yang benar dan masalahnya ada di bentuk probe — revert ke v1.4.1.
-// Verifikasi request tetap ganda (str/hex) seperti v1.4.
+// v1.6 (2026-11-15): diagnostic log readable by the owner without the
+// Cloudflare Console. Requests are kept in an in-memory ring buffer
+// (metadata only: method/path/sig-kind/body-length/keys — never values,
+// never the secret) and served at GET /debug-logs?k=musegoat-debug.
+// REMOVE this endpoint once preflight is fixed. (Cloudflare isolates are
+// per-request, so the buffer only shows requests handled by the same
+// isolate — fetch it right after pressing Save.)
 //
 // SECURITY: the HMAC secret is NEVER in this repo. It comes from the
 // dashboard "Rotate Secret" as env.AGENT_GAMES_HMAC_SECRET. Never commit
@@ -94,6 +93,18 @@ function jsonResponse(secret, obj, status = 200) {
       },
     })
   );
+}
+
+// --- Temporary diagnostic log buffer --------------------------------------
+// In-memory ring buffer (per isolate) of recent request metadata. Read via
+// GET /debug-logs?k=musegoat-debug. REMOVE once preflight is fixed.
+const LOG_BUF = [];
+function logEvt(o) {
+  try {
+    LOG_BUF.push({ t: Date.now(), ...o });
+    if (LOG_BUF.length > 20) LOG_BUF.shift();
+  } catch {}
+  try { console.log(JSON.stringify(o)); } catch {}
 }
 
 // --- Proof-reuse seen-set -------------------------------------------------
@@ -203,7 +214,16 @@ export default {
 
     // GET/HEAD = health/preflight probe (no body to sign): answer handshake.
     if (request.method === "GET" || request.method === "HEAD") {
-      console.log(JSON.stringify({ m: request.method, p: url.pathname, sig: !!sigHeader }));
+      // Temporary diagnostic: recent request log (see LOG_BUF above).
+      if (url.pathname === "/debug-logs" && request.method === "GET") {
+        if (url.searchParams.get("k") !== "musegoat-debug") {
+          return new Response("not found", { status: 404 });
+        }
+        return new Response(JSON.stringify(LOG_BUF), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      logEvt({ m: request.method, p: url.pathname, sig: !!sigHeader });
       return jsonResponse(secret, { ok: true, protocolVersion: "v1" });
     }
     if (request.method !== "POST") {
@@ -249,7 +269,7 @@ export default {
     if (envObj && typeof envObj === "object" && !Array.isArray(envObj)) {
       keys = Object.keys(envObj);
     }
-    console.log(JSON.stringify({ m: request.method, p: url.pathname, sig: sigKind, len: raw.length, json: jsonOk, keys }));
+    logEvt({ m: request.method, p: url.pathname, sig: sigKind, len: raw.length, json: jsonOk, keys });
 
     // Unparseable body can never be a platform preflight (it sends valid
     // JSON) — fail closed, signed.
