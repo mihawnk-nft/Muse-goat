@@ -7,15 +7,13 @@
 // (correct decision still scores +12-2=+10). Proof generation (snarkjs +
 // Kurier, wait-for-Finalized) is the v2 upgrade; see README.md.
 //
-// v1.2 (2026-11-15): dashboard STILL rejects preflight ("must return
-// signed protocol-v1 JSON") even though v1.1 returns signed {ok:true,
-// protocolVersion:"v1"} to every probe Muse tested (GET, unsigned POST
-// preflight). So the platform's real probe must differ from Muse's tests.
-// v1.2 adds: (a) HEAD answered like GET, (b) request logging (method,
-// path, signature presence, body length, top-level KEYS only — never
-// values, never the secret) so the owner can read in Cloudflare Logs
-// exactly what the platform sends, (c) challenge/nonce echo in the
-// preflight reply in case the probe is challenge-response.
+// v1.3 (2026-11-15): endpoint URL di dashboard sudah BENAR tapi preflight
+// tetap gagal ("must return signed protocol-v1 JSON") — jadi probe platform
+// bukan GET/unsigned-preflight biasa. Celah yang ditutup di v1.3: probe
+// bertanda tangan dengan body KOSONG / null / non-object dulu jatuh ke
+// BAD_JSON 400 (karena envObj bukan object). Padahal body non-object tidak
+// mungkin jadi decision task — sekarang dijawab handshake. v1.2 tetap ada:
+// HEAD seperti GET, logging request (keys saja), echo challenge/nonce.
 //
 // SECURITY: the HMAC secret is NEVER in this repo. It comes from the
 // dashboard "Rotate Secret" as env.AGENT_GAMES_HMAC_SECRET. Never commit
@@ -266,12 +264,16 @@ export default {
       return jsonResponse(secret, resp);
     }
 
+    // A parseable body that is not a JSON object (empty, null, string,
+    // number, array) can never be a decision task — answer the handshake
+    // instead of BAD_JSON. (A signed empty-body probe used to land here.)
+    if (!envObj || typeof envObj !== "object" || Array.isArray(envObj)) {
+      return jsonResponse(secret, { ok: true, protocolVersion: "v1" });
+    }
+
     // Decision task. Signature REQUIRED; any exception fails closed.
     if (!sigOk) {
       return jsonResponse(secret, { decision: "REJECT", reason_code: "BAD_SIGNATURE" }, 401);
-    }
-    if (!envObj || typeof envObj !== "object") {
-      return jsonResponse(secret, { decision: "REJECT", reason_code: "BAD_JSON" }, 400);
     }
 
     let result;
