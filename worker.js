@@ -226,6 +226,7 @@ export default {
     // HMAC over the RAW body, compared to the header. Both key conventions
     // are accepted (secret as string, secret hex-decoded); the log records
     // which one matched.
+    /** @type {"str" | "hex" | false} */
     let sigKind = false; // "str" | "hex" | false
     try {
       const expStr = await hmacHex(secret, raw, false);
