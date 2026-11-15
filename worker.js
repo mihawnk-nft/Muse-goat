@@ -7,14 +7,14 @@
 // (correct decision still scores +12-2=+10). Proof generation (snarkjs +
 // Kurier, wait-for-Finalized) is the v2 upgrade; see README.md.
 //
-// v1.4 (2026-11-15): dual HMAC verification + diagnostic logging. The
-// request signature is now checked against BOTH key conventions (secret
-// as UTF-8 string, and secret hex-decoded to bytes) and the log records
-// which one matched ("str" / "hex" / false). Reason: if the platform
-// signs with the hex-decoded key and sends a task-shaped probe, v1.3
-// answered 401 (BAD_SIGNATURE) — the dashboard's generic "must return
-// signed protocol-v1 JSON" could be that 401. Response signing stays
-// string-key until the logs prove the platform uses the hex key.
+// v1.5 (2026-11-15) — EKSPERIMEN: response signing pakai kunci hex-decoded.
+// Secret sudah di-rotate + sinkron tapi preflight tetap gagal, jadi yang
+// tersisa: platform mungkin memverifikasi signature jawaban dengan kunci
+// hasil decode hex (32 byte), bukan string secret-nya. v1.5 menandatangani
+// SEMUA response (handshake + decision) dengan kunci hex-decoded; kalau
+// preflight lolos, konvensi ini yang benar. Kalau tetap gagal, konvensi
+// string yang benar dan masalahnya ada di bentuk probe — revert ke v1.4.1.
+// Verifikasi request tetap ganda (str/hex) seperti v1.4.
 //
 // SECURITY: the HMAC secret is NEVER in this repo. It comes from the
 // dashboard "Rotate Secret" as env.AGENT_GAMES_HMAC_SECRET. Never commit
@@ -78,7 +78,9 @@ function safeEqual(a, b) {
 }
 
 async function signBody(secret, body) {
-  return hmacHex(secret, body);
+  // v1.5: sign responses with the hex-decoded key. Fall back to the
+  // string key only if the secret is not valid hex (it is, 64 hex chars).
+  return (await hmacHex(secret, body, true)) ?? (await hmacHex(secret, body, false));
 }
 
 function jsonResponse(secret, obj, status = 200) {
