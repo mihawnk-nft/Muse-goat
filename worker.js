@@ -1,47 +1,64 @@
-// Muse Goat — Proof Gatekeeper endpoint (v1 scaffold)
+// Muse Goat — Proof Gatekeeper endpoint (v2)
 // Agent Games by zkVerify. Cloudflare Worker (plain JS, no build step).
 //
-// v1 scope: HMAC verification, preflight responder, deterministic 7-check
-// decision loop, signed responses. NO Groth16 proof yet — v1 returns
-// proof:null / public_signals:null and accepts the -2 proof penalty
-// (correct decision still scores +12-2=+10). Proof generation (snarkjs +
-// Kurier, wait-for-Finalized) is the v2 upgrade; see README.md.
+// v2 (2026-11-15): REAL task envelope (from /events/proof-gatekeeper sample
+// task payload, verified by research 15 Nov): decision fields live NESTED
+// under `input` with different names (registered_vk, proof_vk, minimum,
+// public_balance, expiry_block, current_block, recipient,
+// condition_recipient, amount, max_transfer, proof_tx). v1 assumed FLAT
+// top-level fields — it would have REJECTED every real task with
+// MISSING_FIELD_VK. v2 unwraps `input` (top-level kept as fallback).
 //
-// v1.6 (2026-11-15): diagnostic log readable by the owner without the
-// Cloudflare Console. Requests are kept in an in-memory ring buffer
-// (metadata only: method/path/sig-kind/body-length/keys — never values,
-// never the secret) and served at GET /debug-logs?k=musegoat-debug.
-// REMOVE this endpoint once preflight is fixed. (Cloudflare isolates are
-// per-request, so the buffer only shows requests handled by the same
-// isolate — fetch it right after pressing Save.)
+// v2 also fixes the preflight classification: a body is a TASK only if it
+// carries an `input` object or decision fields. A `task_id` (or a
+// proof-gatekeeper `type`) WITHOUT decision fields is a probe → signed
+// handshake. (Hypothesis for the dashboard's stubborn "must return signed
+// protocol-v1 JSON": its probe carries a task_id/type and v1.x
+// misclassified it as a task → 401 / MISSING_FIELD_VK.)
+//
+// Proof: still v1 scope — proof:null / public_signals:null (-2 penalty);
+// Groth16 proof generation + Kurier submit + poll-to-Finalized is the
+// next upgrade. Response task shape echoes `proof_tx` (event page
+// example) alongside proof/public_signals.
+//
+// Response signing is back to the STANDARD convention (secret string as
+// HMAC key). v1.5's hex-decoded signing experiment failed preflight too,
+// so the convention was not the cause. Request verification still accepts
+// both conventions (v1.4).
 //
 // SECURITY: the HMAC secret is NEVER in this repo. It comes from the
 // dashboard "Rotate Secret" as env.AGENT_GAMES_HMAC_SECRET. Never commit
 // .env, never paste the secret in chat, never log it.
 
-// Registered Gatekeeper verification-key hash (zkVerify mainnet,
-// GET https://agentgames.zkverify.io/api/circuit-info).
+// Gatekeeper verification-key hash (zkVerify mainnet,
+// GET https://agentgames.zkverify.io/api/circuit-info). Reserved for future
+// Groth16 proof verification (snarkjs/Kurier); NOT a decide() check — the
+// task's registered_vk is the anchor (see decide check 1).
 const GATEKEEPER_VK_HASH =
   "0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0";
 
 // --- Field map -----------------------------------------------------------
-// The platform's exact task-envelope field names are confirmed against the
-// dashboard sample task (TODO: verify). Each entry lists candidate names;
-// the first one present in the envelope wins. A missing required field
-// fails CLOSED (REJECT), it never guesses a value.
+// Real envelope field names first (events/proof-gatekeeper sample), legacy
+// flat names as fallback. First present value wins. A missing required
+// field fails CLOSED (REJECT), it never guesses a value.
 const F = {
-  vkHash: ["vkHash", "vk_hash", "verificationKeyHash"],
+  registeredVk: ["registered_vk", "registeredVk", "registeredVK", "vkHash", "vk_hash", "verificationKeyHash"],
+  proofVk: ["proof_vk", "proofVk", "proofVK"],
+  proofTx: ["proof_tx", "proofTx", "proofReference", "proof_reference", "proofRef", "reference"],
+  recipient: ["recipient", "to", "payee"],
+  conditionRecipient: ["condition_recipient", "conditionRecipient"],
+  amount: ["amount", "value"],
+  maxTransfer: ["max_transfer", "maxTransfer", "maxAmount"],
+  minimum: ["minimum", "minBalance", "minimumBalance", "threshold"],
+  publicBalance: ["public_balance", "publicBalance", "balance"],
+  expiryBlock: ["expiry_block", "expiryBlock", "deadlineBlock", "expiry", "deadline"],
+  currentBlock: ["current_block", "currentBlock"],
+  issuedAt: ["issued_at", "issuedAt", "timestamp", "ts"],
+  deadlineAt: ["deadline_at", "deadlineAt"],
+  taskId: ["taskId", "task_id", "id"],
+  type: ["type"],
   circuit: ["circuit", "circuitId", "circuit_id"],
   proofSystem: ["proofSystem", "proof_system"],
-  proof: ["proof", "groth16Proof"],
-  publicSignals: ["publicSignals", "public_signals", "publicInputs"],
-  proofRef: ["proofReference", "proof_reference", "proofRef", "reference"],
-  recipient: ["recipient", "to", "payee"],
-  amount: ["amount", "value"],
-  threshold: ["threshold", "minBalance", "minimumBalance"],
-  expiryBlock: ["expiryBlock", "deadlineBlock", "expiry", "deadline"],
-  timestamp: ["timestamp", "issuedAt", "ts"],
-  taskId: ["taskId", "task_id", "id"],
 };
 
 function pick(env, names) {
@@ -77,9 +94,8 @@ function safeEqual(a, b) {
 }
 
 async function signBody(secret, body) {
-  // v1.5: sign responses with the hex-decoded key. Fall back to the
-  // string key only if the secret is not valid hex (it is, 64 hex chars).
-  return (await hmacHex(secret, body, true)) ?? (await hmacHex(secret, body, false));
+  // Standard convention: the secret string as the HMAC key.
+  return hmacHex(secret, body, false);
 }
 
 function jsonResponse(secret, obj, status = 200) {
@@ -108,96 +124,126 @@ function logEvt(o) {
 }
 
 // --- Proof-reuse seen-set -------------------------------------------------
-// v1: in-memory only. A Worker isolate restart clears it, so for production
-// move this to Workers KV (binding SEEN) — a reused proofRef must stay
-// rejected across restarts. NEVER approve a proofRef seen before.
+// In-memory only. A Worker isolate restart clears it, so for production
+// move this to Workers KV (binding SEEN) — a reused proofTx must stay
+// rejected across restarts. NEVER approve a proofTx seen before.
 const seenProofRefs = new Set();
 
-// --- Decision logic: the 7 deterministic checks --------------------------
-// Returns { decision: "APPROVE"|"REJECT", reason_code }.
+// --- Time parsing ----------------------------------------------------------
+// Accepts epoch seconds/ms (number or numeric string) and ISO strings.
+// Returns ms-since-epoch, or undefined when unparseable (caller skips the
+// check instead of failing on a placeholder value).
+function parseTime(v) {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v === "number" && Number.isFinite(v)) return v < 1e12 ? v * 1000 : v;
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (/^\d+$/.test(s)) {
+      const n = Number(s);
+      return n < 1e12 ? n * 1000 : n;
+    }
+    const d = Date.parse(s);
+    if (Number.isFinite(d)) return d;
+  }
+  return undefined;
+}
+
+// --- Decision logic: deterministic checks on the REAL envelope -----------
+// Returns { decision: "APPROVE"|"REJECT", reason_code, proof_tx? }.
 // Fail closed: any missing/invalid input, any failed check, any exception
 // inside here => REJECT. An LLM never makes the final call.
 function decide(env) {
-  const fail = (reason_code) => ({ decision: "REJECT", reason_code });
+  // Merge: `input` wins for decision fields; top-level kept for
+  // task_id/type and as a legacy flat fallback.
+  const inp = env.input && typeof env.input === "object" && !Array.isArray(env.input) ? env.input : {};
+  const d = { ...env, ...inp };
+  const proofTxRaw = pick(d, F.proofTx);
+  const proofTx = proofTxRaw !== undefined ? String(proofTxRaw) : undefined;
+  const fail = (reason_code) => ({
+    decision: "REJECT",
+    reason_code,
+    ...(proofTx !== undefined ? { proof_tx: proofTx } : {}),
+  });
 
-  // 1. Verification key matches the registered Gatekeeper key.
-  const vk = pick(env, F.vkHash);
-  if (vk === undefined) return fail("MISSING_FIELD_VK");
-  if (String(vk).toLowerCase() !== GATEKEEPER_VK_HASH) return fail("BAD_VK");
-
-  // 2. Circuit + proof system are the ones the task expects.
-  const circuit = pick(env, F.circuit);
-  if (circuit !== undefined) {
-    const c = String(circuit).toLowerCase();
-    if (!c.includes("gatekeeper")) return fail("BAD_CIRCUIT");
+  // 0. Task type must be the Proof Gatekeeper game (when present).
+  const type = pick(d, F.type);
+  if (type !== undefined) {
+    const t = String(type).toLowerCase();
+    if (!t.includes("proof-gatekeeper") && !t.includes("gatekeeper")) return fail("BAD_CIRCUIT");
   }
-  const ps = pick(env, F.proofSystem);
-  if (ps !== undefined) {
-    const p = String(ps).toLowerCase();
-    if (!p.includes("groth16")) return fail("BAD_PROOF_SYSTEM");
+
+  // 1. Verification key: the proof's VK must match the registered VK.
+  // (The event page's trap example: proof_vk != registered_vk => REJECT
+  // with VK_SUBSTITUTION.)
+  const regVk = pick(d, F.registeredVk);
+  const proofVk = pick(d, F.proofVk);
+  if (regVk === undefined || proofVk === undefined) return fail("MISSING_FIELD_VK");
+  if (String(proofVk).toLowerCase() !== String(regVk).toLowerCase()) {
+    return fail("VK_SUBSTITUTION");
   }
 
-  // 3. Public inputs prove threshold + recipient + amount.
-  const recipient = pick(env, F.recipient);
+  // 2. Recipient: valid address and matching the condition recipient.
+  const recipient = pick(d, F.recipient);
   if (recipient === undefined) return fail("MISSING_FIELD_RECIPIENT");
   if (!/^0x[0-9a-fA-F]{40}$/.test(String(recipient))) return fail("BAD_RECIPIENT");
+  const condRecipient = pick(d, F.conditionRecipient);
+  if (condRecipient !== undefined &&
+      String(condRecipient).toLowerCase() !== String(recipient).toLowerCase()) {
+    return fail("RECIPIENT_MISMATCH");
+  }
 
-  const amount = pick(env, F.amount);
+  // 3. Threshold: public balance must meet the minimum.
+  const minimum = pick(d, F.minimum);
+  const pubBal = pick(d, F.publicBalance);
+  if (minimum === undefined || pubBal === undefined) return fail("MISSING_FIELD_THRESHOLD");
+  const minN = Number(minimum);
+  const balN = Number(pubBal);
+  if (!Number.isFinite(minN) || !Number.isFinite(balN)) return fail("BAD_THRESHOLD");
+  if (balN < minN) return fail("THRESHOLD_MISMATCH");
+
+  // 4. Amount: positive and within the max transfer.
+  const amount = pick(d, F.amount);
   if (amount === undefined) return fail("MISSING_FIELD_AMOUNT");
   const amt = Number(amount);
   if (!Number.isFinite(amt) || amt <= 0) return fail("BAD_AMOUNT");
-  // TODO: enforce the task's amount cap once the dashboard sample shows
-  // the cap field/value. Never invent a cap number.
-
-  const threshold = pick(env, F.threshold);
-  if (threshold !== undefined) {
-    const t = Number(threshold);
-    if (!Number.isFinite(t)) return fail("BAD_THRESHOLD");
-    // The public inputs must prove the balance meets the threshold;
-    // without the exact public-signals layout this is checked as
-    // presence + numeric sanity. Full public-inputs verification
-    // ships with v2 (snarkjs proof verification against the VK).
+  const maxT = pick(d, F.maxTransfer);
+  if (maxT !== undefined) {
+    const maxN = Number(maxT);
+    if (!Number.isFinite(maxN)) return fail("BAD_MAX_TRANSFER");
+    if (amt > maxN) return fail("AMOUNT_EXCEEDS_MAX");
   }
 
-  // 4. Proof reference not reused.
-  const ref = pick(env, F.proofRef);
-  if (ref !== undefined) {
-    const r = String(ref);
-    if (seenProofRefs.has(r)) return fail("PROOF_REUSED");
+  // 5. Expiry: current block must not pass the expiry block.
+  const expiry = pick(d, F.expiryBlock);
+  const current = pick(d, F.currentBlock);
+  if (expiry !== undefined && current !== undefined) {
+    const e = Number(expiry);
+    const c = Number(current);
+    if (Number.isFinite(e) && Number.isFinite(c) && c > e) return fail("EXPIRED");
   }
 
-  // 5. Verification reached Finalized before approval.
-  // v1: no proof is submitted to zkVerify yet, so there is no Finalized
-  // state to check. This check is NOT faked as passing — it is skipped
-  // in v1 and the response carries proof:null (platform scores -2 for
-  // the missing proof). v2 submits via Kurier and polls to Finalized
-  // BEFORE returning APPROVE.
-
-  // 6. Task signature + timestamp valid.
-  // (HMAC already verified the signature over the raw body before this.)
-  const ts = pick(env, F.timestamp);
-  if (ts !== undefined) {
-    const t = Number(ts);
-    const now = Date.now();
-    const tMs = t < 1e12 ? t * 1000 : t; // accept seconds or ms
-    if (!Number.isFinite(tMs) || Math.abs(now - tMs) > 10 * 60 * 1000) {
-      return fail("BAD_TIMESTAMP");
-    }
+  // 6. Timestamps: issued_at reasonably fresh (60 min tolerance for
+  // delivery delay), deadline_at in the future.
+  const issued = parseTime(pick(d, F.issuedAt));
+  if (issued !== undefined && Math.abs(Date.now() - issued) > 60 * 60 * 1000) {
+    return fail("BAD_TIMESTAMP");
   }
+  const deadline = parseTime(pick(d, F.deadlineAt));
+  if (deadline !== undefined && deadline < Date.now()) return fail("EXPIRED");
 
-  // Expiry: reject an expired task if an expiry/deadline field is present.
-  const exp = pick(env, F.expiryBlock);
-  if (exp !== undefined) {
-    // Block-number expiry needs the current block height (RPC). v1 treats
-    // a numeric expiry far in the past as expired only when it looks like
-    // a timestamp; block-height comparison ships with v2 (RPC lookup).
-    const e = Number(exp);
-    if (Number.isFinite(e) && e > 1e12 && e < Date.now()) return fail("EXPIRED");
-  }
+  // 7. Proof reference not reused.
+  if (proofTx === undefined) return fail("MISSING_FIELD_PROOF");
+  if (seenProofRefs.has(proofTx)) return fail("PROOF_REUSED");
 
-  // All checks passed. Mark the proofRef as seen (only on APPROVE).
-  if (ref !== undefined) seenProofRefs.add(String(ref));
-  return { decision: "APPROVE", reason_code: "OK" };
+  // All checks passed. Mark the proofTx as seen (only on APPROVE).
+  // (Proof verification against the gatekeeper VK + Finalized polling is
+  // the next upgrade; v2 returns proof:null and takes the -2 penalty.)
+  seenProofRefs.add(proofTx);
+  return {
+    decision: "APPROVE",
+    reason_code: "OK",
+    proof_tx: proofTx,
+  };
 }
 
 // --- HTTP handler ---------------------------------------------------------
@@ -208,7 +254,6 @@ export default {
       return new Response("misconfigured: AGENT_GAMES_HMAC_SECRET not set", { status: 500 });
     }
 
-    // Minimal request metadata for debugging (no secret, no body values).
     const url = new URL(request.url);
     const sigHeader = request.headers.get("x-agent-games-signature") || "";
 
@@ -277,37 +322,49 @@ export default {
       return jsonResponse(secret, { decision: "REJECT", reason_code: "BAD_JSON" }, 400);
     }
 
-    // Preflight handshake: a preflight-shaped body (signed or not), or any
-    // unsigned probe that does NOT look like a decision task, gets the
-    // SIGNED {ok:true, protocolVersion:"v1"} reply. The platform's
-    // preflight can arrive unsigned — requiring a signature here is what
-    // made the dashboard report "must return signed protocol v1".
+    // Preflight handshake shapes (signed or not) get the SIGNED
+    // {ok:true, protocolVersion:"v1"} reply.
     const isPreflightShape =
       envObj && typeof envObj === "object" &&
       (envObj.type === "preflight" || envObj.preflight === true ||
         envObj.type === "health" || envObj.type === "healthcheck" ||
         envObj.type === "ping" || envObj.type === "handshake");
-    const looksLikeTask =
-      envObj && typeof envObj === "object" &&
-      (pick(envObj, F.vkHash) !== undefined ||
-        pick(envObj, F.recipient) !== undefined ||
-        pick(envObj, F.amount) !== undefined ||
-        pick(envObj, F.taskId) !== undefined);
-    if (isPreflightShape || (!sigOk && !looksLikeTask)) {
-      // Echo a challenge/nonce if the probe carries one (challenge-response
-      // preflight): the reply stays {ok, protocolVersion} plus the echo.
+    if (isPreflightShape) {
       const resp = { ok: true, protocolVersion: "v1" };
-      if (envObj && typeof envObj === "object") {
-        if (typeof envObj.challenge === "string") resp.challenge = envObj.challenge;
-        if (typeof envObj.nonce === "string") resp.nonce = envObj.nonce;
-      }
+      if (typeof envObj.challenge === "string") resp.challenge = envObj.challenge;
+      if (typeof envObj.nonce === "string") resp.nonce = envObj.nonce;
       return jsonResponse(secret, resp);
     }
 
     // A parseable body that is not a JSON object (empty, null, string,
-    // number, array) can never be a decision task — answer the handshake
-    // instead of BAD_JSON. (A signed empty-body probe used to land here.)
+    // number, array) can never be a decision task — answer the handshake.
     if (!envObj || typeof envObj !== "object" || Array.isArray(envObj)) {
+      return jsonResponse(secret, { ok: true, protocolVersion: "v1" });
+    }
+
+    // TASK or PROBE? A body is a task ONLY if it carries an `input` object
+    // or decision fields. A `task_id` / proof-gatekeeper `type` WITHOUT
+    // decision fields is a probe → signed handshake (v1.x misclassified
+    // such probes as tasks → 401 / MISSING_FIELD_VK).
+    const hasInput =
+      envObj.input && typeof envObj.input === "object" && !Array.isArray(envObj.input);
+    const hasDecisionField =
+      pick(envObj, F.registeredVk) !== undefined ||
+      pick(envObj, F.proofVk) !== undefined ||
+      pick(envObj, F.proofTx) !== undefined ||
+      pick(envObj, F.recipient) !== undefined ||
+      pick(envObj, F.amount) !== undefined ||
+      pick(envObj, F.minimum) !== undefined ||
+      pick(envObj, F.publicBalance) !== undefined ||
+      (hasInput && (
+        pick(envObj.input, F.registeredVk) !== undefined ||
+        pick(envObj.input, F.proofVk) !== undefined ||
+        pick(envObj.input, F.proofTx) !== undefined ||
+        pick(envObj.input, F.recipient) !== undefined ||
+        pick(envObj.input, F.amount) !== undefined ||
+        pick(envObj.input, F.minimum) !== undefined ||
+        pick(envObj.input, F.publicBalance) !== undefined));
+    if (!hasInput && !hasDecisionField) {
       return jsonResponse(secret, { ok: true, protocolVersion: "v1" });
     }
 
@@ -323,12 +380,15 @@ export default {
       result = { decision: "REJECT", reason_code: "ERROR" };
     }
 
-    // v1: no Groth16 proof yet (proof:null). v2 fills proof + public_signals.
-    return jsonResponse(secret, {
+    // v2: no Groth16 proof yet (proof:null). The response echoes proof_tx
+    // (event page example) alongside proof/public_signals.
+    const resp = {
       decision: result.decision,
       reason_code: result.reason_code,
       proof: null,
       public_signals: null,
-    });
+    };
+    if (result.proof_tx !== undefined) resp.proof_tx = result.proof_tx;
+    return jsonResponse(secret, resp);
   },
 };
