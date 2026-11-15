@@ -7,14 +7,15 @@
 // (correct decision still scores +12-2=+10). Proof generation (snarkjs +
 // Kurier, wait-for-Finalized) is the v2 upgrade; see README.md.
 //
-// v1.1 (2026-11-15): preflight fix. The platform's preflight probe can
-// arrive UNSIGNED (or as GET) — v1 rejected those with 401/405 before
-// ever answering the handshake, so the dashboard reported "endpoint must
-// return signed protocol v1". Now: any unsigned probe, any GET, or any
-// preflight-shaped body gets the SIGNED {ok:true, protocolVersion:"v1"}
-// reply. Real decision tasks still REQUIRE a valid HMAC — a signed body
-// that is not a preflight shape goes through the 7 checks; an unsigned
-// body that looks like a task is REJECTED (fail closed).
+// v1.2 (2026-11-15): dashboard STILL rejects preflight ("must return
+// signed protocol-v1 JSON") even though v1.1 returns signed {ok:true,
+// protocolVersion:"v1"} to every probe Muse tested (GET, unsigned POST
+// preflight). So the platform's real probe must differ from Muse's tests.
+// v1.2 adds: (a) HEAD answered like GET, (b) request logging (method,
+// path, signature presence, body length, top-level KEYS only — never
+// values, never the secret) so the owner can read in Cloudflare Logs
+// exactly what the platform sends, (c) challenge/nonce echo in the
+// preflight reply in case the probe is challenge-response.
 //
 // SECURITY: the HMAC secret is NEVER in this repo. It comes from the
 // dashboard "Rotate Secret" as env.AGENT_GAMES_HMAC_SECRET. Never commit
@@ -190,10 +191,10 @@ export default {
     // Minimal request metadata for debugging (no secret, no body values).
     const url = new URL(request.url);
     const sigHeader = request.headers.get("x-agent-games-signature") || "";
-    console.log(JSON.stringify({ m: request.method, p: url.pathname, sig: !!sigHeader }));
 
-    // GET = health/preflight probe (no body to sign): answer the handshake.
-    if (request.method === "GET") {
+    // GET/HEAD = health/preflight probe (no body to sign): answer handshake.
+    if (request.method === "GET" || request.method === "HEAD") {
+      console.log(JSON.stringify({ m: request.method, p: url.pathname, sig: !!sigHeader }));
       return jsonResponse(secret, { ok: true, protocolVersion: "v1" });
     }
     if (request.method !== "POST") {
@@ -214,6 +215,16 @@ export default {
     } catch {
       jsonOk = false;
     }
+
+    // Debug log: method, path, signature presence, body length, top-level
+    // KEYS only — never values, never the secret. Lets the owner read in
+    // Cloudflare Logs exactly what the platform's preflight sends.
+    let keys = null;
+    if (envObj && typeof envObj === "object" && !Array.isArray(envObj)) {
+      keys = Object.keys(envObj);
+    }
+    console.log(JSON.stringify({ m: request.method, p: url.pathname, sig: !!sigHeader, len: raw.length, json: jsonOk, keys }));
+
     // Unparseable body can never be a platform preflight (it sends valid
     // JSON) — fail closed, signed.
     if (!jsonOk) {
@@ -245,7 +256,14 @@ export default {
         pick(envObj, F.amount) !== undefined ||
         pick(envObj, F.taskId) !== undefined);
     if (isPreflightShape || (!sigOk && !looksLikeTask)) {
-      return jsonResponse(secret, { ok: true, protocolVersion: "v1" });
+      // Echo a challenge/nonce if the probe carries one (challenge-response
+      // preflight): the reply stays {ok, protocolVersion} plus the echo.
+      const resp = { ok: true, protocolVersion: "v1" };
+      if (envObj && typeof envObj === "object") {
+        if (typeof envObj.challenge === "string") resp.challenge = envObj.challenge;
+        if (typeof envObj.nonce === "string") resp.nonce = envObj.nonce;
+      }
+      return jsonResponse(secret, resp);
     }
 
     // Decision task. Signature REQUIRED; any exception fails closed.
