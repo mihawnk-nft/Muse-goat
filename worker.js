@@ -7,6 +7,15 @@
 // (correct decision still scores +12-2=+10). Proof generation (snarkjs +
 // Kurier, wait-for-Finalized) is the v2 upgrade; see README.md.
 //
+// v1.1 (2026-11-15): preflight fix. The platform's preflight probe can
+// arrive UNSIGNED (or as GET) — v1 rejected those with 401/405 before
+// ever answering the handshake, so the dashboard reported "endpoint must
+// return signed protocol v1". Now: any unsigned probe, any GET, or any
+// preflight-shaped body gets the SIGNED {ok:true, protocolVersion:"v1"}
+// reply. Real decision tasks still REQUIRE a valid HMAC — a signed body
+// that is not a preflight shape goes through the 7 checks; an unsigned
+// body that looks like a task is REJECTED (fail closed).
+//
 // SECURITY: the HMAC secret is NEVER in this repo. It comes from the
 // dashboard "Rotate Secret" as env.AGENT_GAMES_HMAC_SECRET. Never commit
 // .env, never paste the secret in chat, never log it.
@@ -177,6 +186,16 @@ export default {
     if (!secret) {
       return new Response("misconfigured: AGENT_GAMES_HMAC_SECRET not set", { status: 500 });
     }
+
+    // Minimal request metadata for debugging (no secret, no body values).
+    const url = new URL(request.url);
+    const sigHeader = request.headers.get("x-agent-games-signature") || "";
+    console.log(JSON.stringify({ m: request.method, p: url.pathname, sig: !!sigHeader }));
+
+    // GET = health/preflight probe (no body to sign): answer the handshake.
+    if (request.method === "GET") {
+      return jsonResponse(secret, { ok: true, protocolVersion: "v1" });
+    }
     if (request.method !== "POST") {
       return new Response("method not allowed", { status: 405 });
     }
@@ -188,34 +207,58 @@ export default {
       return jsonResponse(secret, { decision: "REJECT", reason_code: "BAD_BODY" }, 400);
     }
 
-    // HMAC over the RAW body, compared to the header, BEFORE parsing.
-    const sig = request.headers.get("x-agent-games-signature") || "";
-    let expected;
+    let envObj = null;
+    let jsonOk = true;
     try {
-      expected = await hmacHex(secret, raw);
+      envObj = raw ? JSON.parse(raw) : null;
     } catch {
-      return jsonResponse(secret, { decision: "REJECT", reason_code: "ERROR" }, 500);
+      jsonOk = false;
     }
-    if (!safeEqual(sig.trim().toLowerCase(), expected)) {
-      return jsonResponse(secret, { decision: "REJECT", reason_code: "BAD_SIGNATURE" }, 401);
-    }
-
-    let envObj;
-    try {
-      envObj = JSON.parse(raw);
-    } catch {
+    // Unparseable body can never be a platform preflight (it sends valid
+    // JSON) — fail closed, signed.
+    if (!jsonOk) {
       return jsonResponse(secret, { decision: "REJECT", reason_code: "BAD_JSON" }, 400);
     }
 
-    // Preflight handshake: reply { ok: true, protocolVersion: "v1" }, signed.
-    if (envObj && (envObj.type === "preflight" || envObj.preflight === true)) {
+    // HMAC over the RAW body, compared to the header.
+    let sigOk = false;
+    try {
+      sigOk = safeEqual(sigHeader.trim().toLowerCase(), await hmacHex(secret, raw));
+    } catch {
+      sigOk = false;
+    }
+
+    // Preflight handshake: a preflight-shaped body (signed or not), or any
+    // unsigned probe that does NOT look like a decision task, gets the
+    // SIGNED {ok:true, protocolVersion:"v1"} reply. The platform's
+    // preflight can arrive unsigned — requiring a signature here is what
+    // made the dashboard report "must return signed protocol v1".
+    const isPreflightShape =
+      envObj && typeof envObj === "object" &&
+      (envObj.type === "preflight" || envObj.preflight === true ||
+        envObj.type === "health" || envObj.type === "healthcheck" ||
+        envObj.type === "ping" || envObj.type === "handshake");
+    const looksLikeTask =
+      envObj && typeof envObj === "object" &&
+      (pick(envObj, F.vkHash) !== undefined ||
+        pick(envObj, F.recipient) !== undefined ||
+        pick(envObj, F.amount) !== undefined ||
+        pick(envObj, F.taskId) !== undefined);
+    if (isPreflightShape || (!sigOk && !looksLikeTask)) {
       return jsonResponse(secret, { ok: true, protocolVersion: "v1" });
     }
 
-    // Decision task. Any exception inside decide() fails closed.
+    // Decision task. Signature REQUIRED; any exception fails closed.
+    if (!sigOk) {
+      return jsonResponse(secret, { decision: "REJECT", reason_code: "BAD_SIGNATURE" }, 401);
+    }
+    if (!envObj || typeof envObj !== "object") {
+      return jsonResponse(secret, { decision: "REJECT", reason_code: "BAD_JSON" }, 400);
+    }
+
     let result;
     try {
-      result = decide(envObj && typeof envObj === "object" ? envObj : {});
+      result = decide(envObj);
     } catch {
       result = { decision: "REJECT", reason_code: "ERROR" };
     }
