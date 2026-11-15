@@ -7,13 +7,14 @@
 // (correct decision still scores +12-2=+10). Proof generation (snarkjs +
 // Kurier, wait-for-Finalized) is the v2 upgrade; see README.md.
 //
-// v1.3 (2026-11-15): endpoint URL di dashboard sudah BENAR tapi preflight
-// tetap gagal ("must return signed protocol-v1 JSON") — jadi probe platform
-// bukan GET/unsigned-preflight biasa. Celah yang ditutup di v1.3: probe
-// bertanda tangan dengan body KOSONG / null / non-object dulu jatuh ke
-// BAD_JSON 400 (karena envObj bukan object). Padahal body non-object tidak
-// mungkin jadi decision task — sekarang dijawab handshake. v1.2 tetap ada:
-// HEAD seperti GET, logging request (keys saja), echo challenge/nonce.
+// v1.4 (2026-11-15): dual HMAC verification + diagnostic logging. The
+// request signature is now checked against BOTH key conventions (secret
+// as UTF-8 string, and secret hex-decoded to bytes) and the log records
+// which one matched ("str" / "hex" / false). Reason: if the platform
+// signs with the hex-decoded key and sends a task-shaped probe, v1.3
+// answered 401 (BAD_SIGNATURE) — the dashboard's generic "must return
+// signed protocol-v1 JSON" could be that 401. Response signing stays
+// string-key until the logs prove the platform uses the hex key.
 //
 // SECURITY: the HMAC secret is NEVER in this repo. It comes from the
 // dashboard "Rotate Secret" as env.AGENT_GAMES_HMAC_SECRET. Never commit
@@ -52,9 +53,17 @@ function pick(env, names) {
 // --- Crypto helpers (WebCrypto, Workers runtime) -------------------------
 const enc = new TextEncoder();
 
-async function hmacHex(secret, data) {
+async function hmacHex(secret, data, hexKey = false) {
+  let keyData = enc.encode(secret);
+  if (hexKey) {
+    const clean = secret.trim().toLowerCase();
+    if (!/^[0-9a-f]+$/.test(clean) || clean.length % 2 !== 0) return null;
+    const bytes = new Uint8Array(clean.length / 2);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+    keyData = bytes;
+  }
   const key = await crypto.subtle.importKey(
-    "raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+    "raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
   );
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -214,27 +223,35 @@ export default {
       jsonOk = false;
     }
 
-    // Debug log: method, path, signature presence, body length, top-level
-    // KEYS only — never values, never the secret. Lets the owner read in
-    // Cloudflare Logs exactly what the platform's preflight sends.
+    // HMAC over the RAW body, compared to the header. Both key conventions
+    // are accepted (secret as string, secret hex-decoded); the log records
+    // which one matched.
+    let sigKind = false; // "str" | "hex" | false
+    try {
+      const expStr = await hmacHex(secret, raw, false);
+      if (expStr && safeEqual(sigHeader.trim().toLowerCase(), expStr)) sigKind = "str";
+      else {
+        const expHex = await hmacHex(secret, raw, true);
+        if (expHex && safeEqual(sigHeader.trim().toLowerCase(), expHex)) sigKind = "hex";
+      }
+    } catch {
+      sigKind = false;
+    }
+    const sigOk = sigKind !== false;
+
+    // Debug log: method, path, which signature convention matched, body
+    // length, top-level KEYS only — never values, never the secret. Lets
+    // the owner read in Cloudflare Logs exactly what the platform sends.
     let keys = null;
     if (envObj && typeof envObj === "object" && !Array.isArray(envObj)) {
       keys = Object.keys(envObj);
     }
-    console.log(JSON.stringify({ m: request.method, p: url.pathname, sig: !!sigHeader, len: raw.length, json: jsonOk, keys }));
+    console.log(JSON.stringify({ m: request.method, p: url.pathname, sig: sigKind, len: raw.length, json: jsonOk, keys }));
 
     // Unparseable body can never be a platform preflight (it sends valid
     // JSON) — fail closed, signed.
     if (!jsonOk) {
       return jsonResponse(secret, { decision: "REJECT", reason_code: "BAD_JSON" }, 400);
-    }
-
-    // HMAC over the RAW body, compared to the header.
-    let sigOk = false;
-    try {
-      sigOk = safeEqual(sigHeader.trim().toLowerCase(), await hmacHex(secret, raw));
-    } catch {
-      sigOk = false;
     }
 
     // Preflight handshake: a preflight-shaped body (signed or not), or any
